@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-Hant" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MLB 即時比分看板</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          bg: '#0b0f14',
+          panel: '#141b23',
+          panel2: '#1b232d',
+          border: '#2a333e',
+          live: '#22c55e',
+          accent: '#38bdf8',
+        }
+      }
+    }
+  };
+</script>
+<style>
+  body { background-color: #0b0f14; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .fade-in { animation: fadeIn 0.25s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #2a333e; border-radius: 4px; }
+</style>
+</head>
+<body class="min-h-screen bg-bg text-slate-100 font-sans">
+
+<header class="sticky top-0 z-20 border-b border-border bg-bg/90 backdrop-blur">
+  <div class="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center gap-3 justify-between">
+    <div class="flex items-center gap-3">
+      <span class="text-2xl">⚾</span>
+      <div>
+        <h1 class="text-lg font-bold leading-tight">MLB 即時比分看板</h1>
+        <p id="today-label" class="text-xs text-slate-400"></p>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="countdown" class="text-xs text-slate-400 tabular-nums hidden sm:inline">15 秒後自動更新</span>
+      <button id="refresh-btn"
+        class="inline-flex items-center gap-2 rounded-lg bg-panel2 hover:bg-border border border-border px-3 py-1.5 text-sm font-medium transition-colors">
+        <svg id="refresh-icon" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg>
+        重新整理
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-6xl mx-auto px-4 py-6">
+  <div id="status-banner" class="hidden mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-300 text-sm px-4 py-3"></div>
+  <div id="games-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+</main>
+
+<footer class="max-w-6xl mx-auto px-4 py-8 text-center text-xs text-slate-500">
+  資料來源：MLB Stats API（statsapi.mlb.com）・僅供個人非商業用途參考
+</footer>
+
+<script>
+const SCHEDULE_URL = 'https://statsapi.mlb.com/api/v1/schedule?sportId=1&hydrate=linescore,team';
+const LIVE_FEED_URL = (gamePk) => `https://statsapi.mlb.com/api/v1.1/game/${gamePk}/feed/live`;
+const POLL_SECONDS = 15;
+const FETCH_TIMEOUT_MS = 8000;
+
+const gamesGrid = document.getElementById('games-grid');
+const statusBanner = document.getElementById('status-banner');
+const countdownEl = document.getElementById('countdown');
+const refreshBtn = document.getElementById('refresh-btn');
+const refreshIcon = document.getElementById('refresh-icon');
+const todayLabel = document.getElementById('today-label');
+
+let countdownValue = POLL_SECONDS;
+let countdownTimer = null;
+let pollTimer = null;
+let expandedGamePk = null;
+let liveFeedTimer = null;
+
+const STATE_MAP = {
+  'Preview': { label: '未開打', cls: 'bg-slate-700 text-slate-200' },
+  'Pre-Game': { label: '賽前準備', cls: 'bg-slate-700 text-slate-200' },
+  'Warmup': { label: '熱身中', cls: 'bg-amber-600/80 text-white' },
+  'In Progress': { label: '進行中', cls: 'bg-live/90 text-black font-semibold' },
+  'Final': { label: '已結束', cls: 'bg-slate-600 text-slate-100' },
+  'Game Over': { label: '已結束', cls: 'bg-slate-600 text-slate-100' },
+  'Postponed': { label: '延賽', cls: 'bg-red-600/80 text-white' },
+  'Suspended': { label: '中斷', cls: 'bg-red-600/80 text-white' },
+  'Cancelled': { label: '取消', cls: 'bg-red-600/80 text-white' },
+};
+
+function stateInfo(detailedState) {
+  return STATE_MAP[detailedState] || { label: detailedState || '未知', cls: 'bg-slate-700 text-slate-200' };
+}
+
+function withTimeout(promise, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { controller, run: promise(controller.signal).finally(() => clearTimeout(timer)) };
+}
+
+async function fetchJson(url) {
+  const { controller, run } = withTimeout((signal) => fetch(url, { signal }), FETCH_TIMEOUT_MS);
+  let resp;
+  try {
+    resp = await run;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('連線逾時，請稍後再試');
+    throw new Error('網路連線失敗，請檢查網路狀態');
+  }
+  if (!resp.ok) throw new Error(`API 回應錯誤（狀態碼 ${resp.status}）`);
+  try {
+    return await resp.json();
+  } catch (err) {
+    throw new Error('回應格式錯誤');
+  }
+}
+
+function showBanner(message, isError = true) {
+  statusBanner.textContent = message;
+  statusBanner.classList.remove('hidden');
+  statusBanner.classList.toggle('border-amber-500/30', !isError);
+  statusBanner.classList.toggle('bg-amber-500/10', !isError);
+  statusBanner.classList.toggle('text-amber-300', !isError);
+  statusBanner.classList.toggle('border-red-500/30', isError);
+  statusBanner.classList.toggle('bg-red-500/10', isError);
+  statusBanner.classList.toggle('text-red-300', isError);
+}
+
+function hideBanner() {
+  statusBanner.classList.add('hidden');
+}
+
+function teamAbbrev(team) {
+  return (team && (team.abbreviation || (team.teamName || team.name || '').slice(0, 3).toUpperCase())) || '???';
+}
+
+function basesDiagram(offense) {
+  const on1 = !!(offense && offense.first);
+  const on2 = !!(offense && offense.second);
+  const on3 = !!(offense && offense.third);
+  const baseCls = (on) => on ? 'bg-accent border-accent' : 'bg-transparent border-slate-500';
+  return `
+    <div class="relative w-11 h-11 mx-auto">
+      <div class="absolute w-3.5 h-3.5 border-2 rotate-45 top-0 left-1/2 -translate-x-1/2 -translate-y-1/2 ${baseCls(on2)}"></div>
+      <div class="absolute w-3.5 h-3.5 border-2 rotate-45 top-1/2 left-0 -translate-x-1/2 -translate-y-1/2 ${baseCls(on3)}"></div>
+      <div class="absolute w-3.5 h-3.5 border-2 rotate-45 top-1/2 left-full -translate-x-1/2 -translate-y-1/2 ${baseCls(on1)}"></div>
+      <div class="absolute w-3.5 h-3.5 border-2 border-slate-600 rotate-45 top-full left-1/2 -translate-x-1/2 -translate-y-1/2 bg-transparent"></div>
+    </div>`;
+}
+
+function ordinalInning(num) {
+  const n = Number(num);
+  if (!n) return num;
+  const suffixes = { 1: 'st', 2: 'nd', 3: 'rd' };
+  const mod100 = n % 100;
+  const suffix = (mod100 >= 11 && mod100 <= 13) ? 'th' : (suffixes[n % 10] || 'th');
+  return `${n}${suffix}`;
+}
+
+function renderGameCard(game) {
+  const away = game.teams.away;
+  const home = game.teams.home;
+  const state = stateInfo(game.status.detailedState);
+  const gamePk = game.gamePk;
+  const isExpanded = expandedGamePk === gamePk;
+  const isLive = game.status.detailedState === 'In Progress';
+
+  const linescore = game.linescore || {};
+  let inningLine = '';
+  if (isLive && linescore.currentInning) {
+    const half = linescore.inningState === 'Top' ? 'Top' : (linescore.inningState === 'Bottom' ? 'Bot' : linescore.inningState || '');
+    inningLine = `${half} ${ordinalInning(linescore.currentInning)}`;
+  } else if (game.status.detailedState === 'Final' || game.status.detailedState === 'Game Over') {
+    inningLine = linescore.currentInning ? `完場 ${ordinalInning(linescore.currentInning)}` : '完場';
+  }
+
+  const card = document.createElement('div');
+  card.className = 'fade-in rounded-xl border border-border bg-panel overflow-hidden transition-shadow hover:shadow-lg hover:shadow-black/30';
+  card.innerHTML = `
+    <button class="w-full text-left p-4 cursor-pointer" data-toggle="${gamePk}">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-[11px] px-2 py-0.5 rounded-full ${state.cls}">${state.label}</span>
+        <span class="text-[11px] text-slate-400">${inningLine}</span>
+      </div>
+      <div class="space-y-2">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="w-9 h-9 shrink-0 rounded-full bg-panel2 border border-border flex items-center justify-center text-[11px] font-bold">${teamAbbrev(away.team)}</span>
+            <span class="truncate text-sm font-medium">${away.team.name}</span>
+          </div>
+          <span class="text-xl font-bold tabular-nums ml-2">${away.score ?? '-'}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="w-9 h-9 shrink-0 rounded-full bg-panel2 border border-border flex items-center justify-center text-[11px] font-bold">${teamAbbrev(home.team)}</span>
+            <span class="truncate text-sm font-medium">${home.team.name}</span>
+          </div>
+          <span class="text-xl font-bold tabular-nums ml-2">${home.score ?? '-'}</span>
+        </div>
+      </div>
+      ${isLive ? `<div class="mt-3 text-center text-[11px] text-accent">點擊查看即時詳情 ${isExpanded ? '▲' : '▼'}</div>` : ''}
+    </button>
+    <div id="detail-${gamePk}" class="border-t border-border ${isExpanded ? '' : 'hidden'}"></div>
+  `;
+  return card;
+}
+
+function renderLiveDetail(container, data) {
+  const live = (data && data.liveData) || {};
+  const linescore = live.linescore || {};
+  const plays = live.plays || {};
+  const currentPlay = plays.currentPlay || {};
+  const count = currentPlay.count || {};
+  const balls = count.balls ?? linescore.balls ?? 0;
+  const strikes = count.strikes ?? linescore.strikes ?? 0;
+  const outs = count.outs ?? linescore.outs ?? 0;
+  const offense = linescore.offense || {};
+
+  container.innerHTML = `
+    <div class="p-4 bg-panel2/60 fade-in">
+      <div class="grid grid-cols-3 gap-3 text-center mb-4">
+        <div class="rounded-lg bg-panel border border-border py-2">
+          <div class="text-[10px] text-slate-400 mb-1">出局數</div>
+          <div class="text-lg font-bold tabular-nums">${outs} <span class="text-xs text-slate-400">/ 2</span></div>
+        </div>
+        <div class="rounded-lg bg-panel border border-border py-2">
+          <div class="text-[10px] text-slate-400 mb-1">好壞球</div>
+          <div class="text-lg font-bold tabular-nums">${balls}-${strikes}</div>
+        </div>
+        <div class="rounded-lg bg-panel border border-border py-2 flex flex-col items-center justify-center">
+          <div class="text-[10px] text-slate-400 mb-1">壘包</div>
+          ${basesDiagram(offense)}
+        </div>
+      </div>
+      <div class="text-[11px] text-slate-500 text-right">最後更新：${new Date().toLocaleTimeString('zh-TW', { hour12: false })}</div>
+    </div>
+  `;
+}
+
+async function loadLiveDetail(gamePk) {
+  const container = document.getElementById(`detail-${gamePk}`);
+  if (!container) return;
+  container.innerHTML = `<div class="p-4 text-xs text-slate-400 flex items-center gap-2"><svg class="w-4 h-4 spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 12a8 8 0 018-8" /></svg>載入即時資訊中...</div>`;
+  try {
+    const data = await fetchJson(LIVE_FEED_URL(gamePk));
+    if (expandedGamePk !== gamePk) return;
+    renderLiveDetail(container, data);
+  } catch (err) {
+    if (expandedGamePk !== gamePk) return;
+    container.innerHTML = `<div class="p-4 text-xs text-red-300">即時資訊載入失敗：${err.message}</div>`;
+  }
+}
+
+function stopLiveFeedPolling() {
+  if (liveFeedTimer) { clearInterval(liveFeedTimer); liveFeedTimer = null; }
+}
+
+function toggleGame(gamePk) {
+  const container = document.getElementById(`detail-${gamePk}`);
+  if (!container) return;
+  if (expandedGamePk === gamePk) {
+    expandedGamePk = null;
+    container.classList.add('hidden');
+    stopLiveFeedPolling();
+    return;
+  }
+  if (expandedGamePk !== null) {
+    const prev = document.getElementById(`detail-${expandedGamePk}`);
+    if (prev) prev.classList.add('hidden');
+  }
+  expandedGamePk = gamePk;
+  container.classList.remove('hidden');
+  stopLiveFeedPolling();
+  loadLiveDetail(gamePk);
+  liveFeedTimer = setInterval(() => loadLiveDetail(gamePk), POLL_SECONDS * 1000);
+}
+
+function renderGames(games) {
+  gamesGrid.innerHTML = '';
+  if (!games || games.length === 0) {
+    gamesGrid.innerHTML = `
+      <div class="col-span-full text-center py-16 text-slate-400">
+        <div class="text-4xl mb-3">🗓️</div>
+        <p>今天沒有排定的 MLB 賽事</p>
+      </div>`;
+    return;
+  }
+  games.forEach((game) => {
+    const card = renderGameCard(game);
+    gamesGrid.appendChild(card);
+  });
+  gamesGrid.querySelectorAll('[data-toggle]').forEach((btn) => {
+    btn.addEventListener('click', () => toggleGame(Number(btn.dataset.toggle)));
+  });
+}
+
+let hasLoadedOnce = false;
+
+async function loadSchedule() {
+  refreshIcon.classList.add('spin');
+  try {
+    const data = await fetchJson(SCHEDULE_URL);
+    const games = (data.dates || []).flatMap((d) => d.games || []);
+    renderGames(games);
+    hasLoadedOnce = true;
+    hideBanner();
+  } catch (err) {
+    showBanner(`資料載入失敗：${err.message}（將於下次自動輪詢重試）`, true);
+    if (!hasLoadedOnce) {
+      gamesGrid.innerHTML = `
+        <div class="col-span-full text-center py-16 text-slate-400">
+          <div class="text-4xl mb-3">📡</div>
+          <p>暫時無法連線到 MLB 資料來源</p>
+          <p class="text-xs mt-1">請確認網路連線後點擊右上角「重新整理」</p>
+        </div>`;
+    }
+  } finally {
+    refreshIcon.classList.remove('spin');
+  }
+}
+
+function resetCountdown() {
+  countdownValue = POLL_SECONDS;
+  countdownEl.textContent = `${countdownValue} 秒後自動更新`;
+}
+
+function startPolling() {
+  resetCountdown();
+  if (countdownTimer) clearInterval(countdownTimer);
+  countdownTimer = setInterval(() => {
+    countdownValue -= 1;
+    if (countdownValue <= 0) {
+      loadSchedule();
+      resetCountdown();
+    } else {
+      countdownEl.textContent = `${countdownValue} 秒後自動更新`;
+    }
+  }, 1000);
+}
+
+refreshBtn.addEventListener('click', () => {
+  loadSchedule();
+  resetCountdown();
+});
+
+function updateDateLabel() {
+  const now = new Date();
+  todayLabel.textContent = now.toLocaleDateString('zh-TW', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
+}
+
+updateDateLabel();
+loadSchedule();
+startPolling();
+</script>
+</body>
+</html>
